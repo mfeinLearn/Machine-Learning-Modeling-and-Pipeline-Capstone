@@ -187,7 +187,9 @@
 **Acquire:**
 
 1. **Download the primary dataset.**
-   - Use `huggingface_hub` (`snapshot_download`), pinned to a commit hash for reproducibility.
+   - Use `huggingface_hub` (`snapshot_download`), pinned to a commit hash for reproducibility.  
+     *(Pinned means locking the download to a specific commit hash so the exact files cannot change later. This guarantees anyone who re-runs the project gets the same data.  
+     Example: instead of always downloading the latest version of the dataset, you record the commit hash `a1b2c3d` and always download that exact snapshot. Even if the dataset owner later adds or changes rows, your project still uses the original files.)*
    - Load only the needed columns with `pandas.read_parquet(columns=[...])` so memory stays manageable.
 2. **Build text and labels.**
    - `cot_text` = `reasoning` if non-empty, else `output`.
@@ -280,36 +282,41 @@ clf = Pipeline([("pre", pre), ("model", LogisticRegression(class_weight="balance
 
 ### 2.3 Modeling Strategy
 
-| #       | Model                                                                                                                                                                                            | Why                                                                                   |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
-| 0       | **DummyClassifier** (stratified / most-frequent)                                                                                                                                                 | The floor that every model must beat                                                  |
-| 1       | **Logistic Regression and Linear SVM** on TF-IDF + engineered features                                                                                                                           | Strong, fast, interpretable sparse-text baseline; coefficients map to phrases         |
-| 2       | **Gradient Boosting** (`HistGradientBoostingClassifier`, optionally XGBoost) on engineered numeric features + SVD-reduced TF-IDF                                                                 | Captures non-linear interactions (e.g., short CoT × answer matches hint × no hedging) |
-| 3       | **Embedding-based classifier**: sentence-transformer embeddings (e.g., `all-MiniLM-L6-v2`) or a lightweight transformer encoder, with a logistic/MLP head, concatenated with engineered features | Captures semantics that n-grams miss, such as paraphrased rationalization             |
-| Stretch | Zero-shot **LLM-as-judge** monitor; fine-tuned ModernBERT (Warner et al., 2024)                                                                                                                  | Shows where a cheap trained classifier stands next to a generic LLM monitor           |
+**First milestone (text-only, one benchmark):**  
+Start with one benchmark (MMLU) and the DeepSeek-R1, QwQ-32B, and Qwen3 outputs identified for unrestricted training.  
+
+| # | Model | Why |
+| --- | --- | --- |
+| 0 | **DummyClassifier** (most-frequent / stratified) | Simple baseline every model must beat |
+| 1 | **TF-IDF Logistic Regression** | Strong, fast, interpretable sparse-text baseline; coefficients map to phrases |
+
+- Keep all versions of each question in the same split (`StratifiedGroupKFold` or train/val/test by `question_id`).  
+- Choose the decision cutoff on the validation set to target recall ≥ 0.80 at precision ≥ 0.50.  
+- Report precision and recall on held-out questions.  
+- If the target is missed, show the achieved trade-off and walk through two or three cases the model missed.
+
+**Once the first comparison works:**  
+Add **Linear SVM** and **Naive Bayes** (MultinomialNB on TF-IDF). Use the results in a small Streamlit demo.  
+
+| # | Model | Why |
+| --- | --- | --- |
+| 2 | **Linear SVM** on TF-IDF | Strong sparse-text alternative; often competitive with LR |
+| 3 | **Naive Bayes** (MultinomialNB) on TF-IDF | Fast classical baseline; good for comparison |
+
+**Optional / stretch (after the demo works):**  
+- Gradient Boosting on engineered features + SVD-reduced TF-IDF.  
+- Embedding-based classifier (sentence-transformer + logistic head).  
+- FastAPI `/score` endpoint.  
+- Second dataset (richardyoung) for unseen-model test. If used, check exact model IDs and exclude any that appeared in training.
 
 **Validation design:**
 
-- **StratifiedGroupKFold (k=5) with groups = `question_id`.**
-  - All rows for a question, across every model and hint type, stay in one fold.
-  - So neither the question nor the model's other answers to it can leak.
-- **Locked test set:** 20% of question groups, touched once at the end.
-- **Generalization hold-outs:**
-  1. **Held-out hint type:** train on 4 hint types, test on the 5th (e.g., `05_xml_metadata`), rotated where time allows.
-  2. **Held-out models:** train on 6 models and test on 2 (e.g., one reasoning and one non-reasoning).
-  3. **Unseen-model test:** the richardyoung dataset (12 models), evaluated once.
-- **Hard-subset analysis (reported):**
-  - Metrics on rows whose CoT does _not_ mention the hint.
-  - This is the realistic monitoring case: the detector must tell "steered silently" from "unaffected".
-- **Hyperparameter tuning:**
-  - `GridSearchCV` for the linear models (C, n-gram range, min_df).
-  - `RandomizedSearchCV` for gradient boosting (learning rate, max_depth, max_leaf_nodes, l2_regularization).
-  - Both run on the development subsample with group folds.
-  - Both are scored on **average precision**, with a recall-at-precision-floor check.
-- **Class imbalance:**
-  - `class_weight="balanced"` first; then threshold tuning and sample weights.
-  - Thresholds are chosen on validation folds for recall ≥ target at precision ≥ floor.
-- **Calibration:** `CalibratedClassifierCV` (isotonic or sigmoid) on the selected model.
+- **Groups = `question_id`** so all versions of a question stay together.  
+- Cutoff chosen on validation; final precision/recall reported on held-out questions.  
+- Hard-subset analysis (CoTs that do not mention the hint) reported.  
+- Hyperparameter search (GridSearchCV on C, n-gram range, min_df) scored on average precision, with the recall-at-precision-floor check.  
+- Class imbalance handled with `class_weight="balanced"` and threshold tuning.  
+- Calibration (`CalibratedClassifierCV`) applied to the selected model if time allows.
 
 **Metric justification:**
 
@@ -347,9 +354,10 @@ clf = Pipeline([("pre", pre), ("model", LogisticRegression(class_weight="balance
 
 **Deployment artifact:**
 
-- A **Streamlit app** plus a small **FastAPI `/score` endpoint**.
-- **Input:** a prompt, CoT and answer.
-- **Output:** an unfaithfulness probability, the top contributing features, and a review recommendation.
+- A **small Streamlit demo** that loads the saved Pipeline.  
+- **Input:** CoT text (and optional answer/hint info).  
+- **Output:** unfaithfulness probability, review recommendation, and a clear “per 1,000 responses” summary (caught / missed / sent to review).  
+- FastAPI `/score` endpoint and embeddings are optional and only added if the first Streamlit demo is working.
 
 ### 2.5 Conceptual Framework
 
@@ -401,13 +409,13 @@ flowchart TD
 
 | Start Date | Due Date   | Phase                                               | Key milestone                                                                                                    |
 | ---------- | ---------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Tue Nov 24 | Wed Nov 25 | **1. Dataset finalization and problem formulation** | Both datasets downloaded and pinned; labels built; label audit done; repo set up                                 |
-| Wed Nov 25 | Fri Nov 27 | **2. Exploratory Data Analysis**                    | EDA notebook and data quality report (light holiday days)                                                        |
-| Sat Nov 28 | Mon Nov 30 | **3. Data Preprocessing**                           | Pipeline built and tested; splits and hold-outs fixed                                                            |
-| Tue Dec 1  | Sat Dec 5  | **4. Model Development**                            | Baselines and 3+ algorithms compared, tuned and cross-validated; final candidate chosen                          |
-| Sat Dec 5  | Mon Dec 7  | **5. Model Evaluation and Refinement**              | Held-out and unseen-model tests; business metrics; interpretation (uses the days reclaimed from data generation) |
-| Tue Dec 8  | Wed Dec 9  | **6. Documentation and Reporting**                  | Technical report, demo and executive presentation (**core work complete**)                                       |
-| Thu Dec 10 | Sun Dec 13 | **7. Final Review and Submission**                  | QA, video, **submit by Dec 13** (buffer included)                                                                |
+| Tue Nov 24 | Wed Nov 25 | **1. Dataset finalization and problem formulation** | Primary dataset (one benchmark) downloaded and pinned; labels built for DeepSeek-R1 / QwQ-32B / Qwen3; label audit started; repo set up |
+| Wed Nov 25 | Fri Nov 27 | **2. Exploratory Data Analysis**                    | EDA notebook focused on the three models (light holiday days)                                                    |
+| Sat Nov 28 | Mon Nov 30 | **3. Data Preprocessing**                           | Text-only Pipeline (TF-IDF) built; question-grouped splits fixed                                                 |
+| Tue Dec 1  | Thu Dec 3  | **4. First model comparison**                       | Dummy vs TF-IDF Logistic Regression; cutoff on validation; precision/recall on held-out questions; error cases walked through |
+| Fri Dec 4  | Sun Dec 7  | **5. Expand + demo**                                | Add Linear SVM and Naive Bayes; small Streamlit demo with per-1,000 summary                                     |
+| Mon Dec 8  | Wed Dec 9  | **6. Documentation and Reporting**                  | Technical report, demo walkthrough and executive presentation (**core work complete**)                          |
+| Thu Dec 10 | Sun Dec 13 | **7. Final Review and Submission**                  | QA, video, optional stretch items only if time remains, **submit by Dec 13**                                    |
 
 **Phase details:**
 
@@ -445,35 +453,22 @@ flowchart TD
   - Held-out hint type and held-out models.
   - Stratified development subsample.
 
-**4. Model Development (Tue Dec 1 – Sat Dec 5)**
+**4. First model comparison (Tue Dec 1 – Thu Dec 3)**
 
-- **Baselines:** Dummy, Logistic Regression, Linear SVM.
-- **Algorithm comparison:** HistGradientBoosting and the embedding classifier, plus the feature-group ablation.
-- **Hyperparameter tuning:** GridSearchCV and RandomizedSearchCV scored on average precision.
-- **Cross-validation:**
-  - Grouped 5-fold CV.
-  - Leakage sanity checks, e.g., a shuffled-label test.
+- **Baselines:** DummyClassifier and TF-IDF Logistic Regression on the three models / one benchmark.  
+- **Validation:** question-grouped split; cutoff chosen on validation set.  
+- **Report:** precision and recall on held-out questions; if target missed, show trade-off and walk through 2–3 missed cases.
 
-**5. Model Evaluation and Refinement (Sat Dec 5 – Mon Dec 7)**
+**5. Expand + demo (Fri Dec 4 – Sun Dec 7)**
 
-- **Final model selection:** threshold choice and calibration.
-- **Test performance:**
-  - One-time locked test.
-  - Held-out hint type and held-out models.
-  - richardyoung unseen-model test.
-  - Hard-subset analysis.
-- **Business metric calculation:** "per 1,000 explanations" table and review-cost estimate.
-- **Interpretation:** SHAP, permutation importance, error-analysis gallery.
-- _Stretch slice only if on schedule._
+- Add Linear SVM and Naive Bayes.  
+- Build small Streamlit demo that shows caught / missed / sent-to-review counts per 1,000 responses.  
+- Business metric calculation using the $2-per-review estimate.
 
-**6. Documentation and Reporting (Tue Dec 8 – Wed Dec 9)**
+**6. Documentation and Reporting (Mon Dec 8 – Wed Dec 9)**
 
-- **Code commenting/cleanup:** docstrings, README, reproducible scripts.
-- **Technical report:** final notebook and written summary.
-- **Executive presentation:**
-  - Slide deck draft.
-  - Streamlit demo and `/score` API.
-- **Core work complete Dec 9.**
+- Technical report and executive presentation centered on the first milestone results and the Streamlit demo.  
+- **Core work complete Dec 9.** Optional items (embeddings, FastAPI, second dataset) only if time remains.
 
 **7. Final Review and Submission (Thu Dec 10 – Sun Dec 13)**
 
@@ -504,7 +499,7 @@ flowchart TD
 | **Spurious shortcuts** (classifier just learns "mentions the hint")                             | Hard-subset metrics; ablate `hint_mention_flag`; leave-one-hint-type-out; inspect top n-grams                                                                                                                       |
 | **Dataset shift on the unseen-model test** (different labeling pipeline)                        | Report it as an out-of-distribution result with the caveat; compare label definitions; show per-model breakdown                                                                                                     |
 | **Holiday time loss**                                                                           | Only light EDA tasks Nov 26–27; 4-day buffer Dec 10–13                                                                                                                                                              |
-| **Scope creep** (perturbation slice, fine-tuning, LLM judge)                                    | Must-have list = the 3 required models plus the demo; stretch items attempted only after core milestones are met and dropped without affecting deliverables                                                         |
+| **Scope creep** (embeddings, FastAPI, second dataset, gradient boosting) | Must-have = text-only TF-IDF LR vs dummy on one benchmark (DeepSeek-R1, QwQ-32B, Qwen3) + Streamlit demo with SVM/NB; everything else is optional and only after the first milestone works |
 
 ### 3.3 Scope, limitations and ethics
 
@@ -559,3 +554,4 @@ flowchart TD
 ## References
 
 Full citations and links are in [`cot_faithfulness_references.md`](cot_faithfulness_references.md).
+
